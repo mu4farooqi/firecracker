@@ -129,8 +129,7 @@ pub enum MicrovmStateError {
     UnexpectedVcpuResponse,
 }
 
-/// Errors associated with creating a snapshot.
-#[rustfmt::skip]
+/// Error definitions for the snapshot creation.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CreateSnapshotError {
     /// Cannot get dirty bitmap: {0}
@@ -145,6 +144,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot create free pages bitmap: {0}
+    FreePagesbitmap(#[from] crate::snapshot::free_pages::FreePagesError),
 }
 
 /// Snapshot version
@@ -165,6 +166,15 @@ pub fn create_snapshot(
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
+    // For full snapshots, collect free pages and zero them in memory file for better compression
+    if matches!(params.snapshot_type, crate::vmm_config::snapshot::SnapshotType::Full) {
+        let free_pages_bitmap = collect_free_pages_for_zeroing(vmm, vm_info)?;
+        // Only zero pages if there are actually any free pages to optimize
+        if free_pages_bitmap.free_page_count() > 0 {
+            zero_free_pages_in_memory_file(&params.mem_file_path, &free_pages_bitmap)?;
+        }
+    }
+
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is because we don't mark pages as dirty during runtime
     // for queue objects.
@@ -183,6 +193,193 @@ pub fn create_snapshot(
         .unwrap();
 
     Ok(())
+}
+
+/// Collects free pages information from balloon devices for memory zeroing optimization.
+/// This creates a temporary bitmap for zeroing but doesn't save it to a file.
+fn collect_free_pages_for_zeroing(
+    vmm: &Vmm,
+    vm_info: &VmInfo,
+) -> Result<crate::snapshot::free_pages::FreePagesbitmap, CreateSnapshotError> {
+    use crate::snapshot::free_pages::create_free_pages_bitmap;
+    use std::collections::HashSet;
+
+    // Collect inflated pages from all balloon devices
+    let mut all_inflated_pages = HashSet::new();
+
+    vmm.mmio_device_manager
+        .for_each_virtio_device(|_, _, device_type, dev| {
+            if device_type == &crate::devices::virtio::TYPE_BALLOON {
+                let d = dev.lock().unwrap();
+                if let Some(balloon) = d.as_any().downcast_ref::<crate::devices::virtio::balloon::Balloon>() {
+                    let inflated_pages = balloon.inflated_pages();
+                    all_inflated_pages.extend(inflated_pages.iter());
+
+                    // Log memory overhead information
+                    if let Some(overhead) = balloon.tracking_memory_overhead() {
+                        crate::logger::info!(
+                            "Balloon device inflated pages tracking overhead: {} KB, {} pages tracked",
+                            overhead / 1024,
+                            inflated_pages.len()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    // Calculate total memory pages (assuming 4KB pages)
+    const PAGE_SIZE: u32 = 4096;
+    let total_memory_bytes = vm_info.mem_size_mib * 1024 * 1024;
+    let total_pages = total_memory_bytes / PAGE_SIZE as u64;
+
+    // Create the bitmap for zeroing (but don't save to file)
+    let bitmap = create_free_pages_bitmap(&all_inflated_pages, total_pages, PAGE_SIZE)?;
+
+    crate::logger::info!(
+        "Collected free pages for memory zeroing: {} free pages out of {} total pages ({:.2}% free)",
+        bitmap.free_page_count(),
+        total_pages,
+        (bitmap.free_page_count() as f64 / total_pages as f64) * 100.0
+    );
+
+    Ok(bitmap)
+}
+
+/// Efficiently zeros out free pages in the memory file to improve compression.
+/// Uses buffered I/O and batch processing for optimal performance.
+fn zero_free_pages_in_memory_file(
+    mem_file_path: &std::path::Path,
+    bitmap: &crate::snapshot::free_pages::FreePagesbitmap,
+) -> Result<(), CreateSnapshotError> {
+    use std::fs::OpenOptions;
+    use std::io::{BufWriter, Seek, SeekFrom, Write};
+
+    const PAGE_SIZE: u64 = 4096;
+    const ZERO_BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for efficient I/O
+    const BATCH_SIZE: usize = ZERO_BUFFER_SIZE / PAGE_SIZE as usize; // 16 pages per batch
+
+    // Open the memory file for read/write
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mem_file_path)
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("open", err))?;
+
+    let mut writer = BufWriter::new(file);
+    let zero_page = vec![0u8; PAGE_SIZE as usize];
+    let mut pages_zeroed = 0;
+    let mut bytes_zeroed = 0u64;
+
+    // Process free pages in batches for efficiency
+    let mut current_batch = Vec::new();
+
+    // Collect all free pages into batches
+    for page_num in 0..bitmap.total_pages {
+        if bitmap.is_page_free(page_num) {
+            current_batch.push(page_num);
+
+            // Process batch when full or at end
+            if current_batch.len() >= BATCH_SIZE {
+                let batch_result = zero_pages_batch(&mut writer, &current_batch, &zero_page)?;
+                pages_zeroed += batch_result.0;
+                bytes_zeroed += batch_result.1;
+                current_batch.clear();
+            }
+        }
+    }
+
+    // Process remaining pages in the last batch
+    if !current_batch.is_empty() {
+        let batch_result = zero_pages_batch(&mut writer, &current_batch, &zero_page)?;
+        pages_zeroed += batch_result.0;
+        bytes_zeroed += batch_result.1;
+    }
+
+    // Ensure all writes are flushed
+    writer.flush()
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("flush", err))?;
+
+    crate::logger::info!(
+        "Zeroed {} free pages ({:.2} MB) in memory file for improved compression",
+        pages_zeroed,
+        bytes_zeroed as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(())
+}
+
+/// Efficiently zeros a batch of pages using optimized I/O operations.
+/// Returns (pages_processed, bytes_written).
+fn zero_pages_batch(
+    writer: &mut BufWriter<std::fs::File>,
+    page_numbers: &[u32],
+    zero_page: &[u8],
+) -> Result<(usize, u64), CreateSnapshotError> {
+    const PAGE_SIZE: u64 = 4096;
+
+    // Sort pages to minimize seek operations
+    let mut sorted_pages = page_numbers.to_vec();
+    sorted_pages.sort_unstable();
+
+    let mut bytes_written = 0u64;
+    let mut consecutive_start = None;
+    let mut consecutive_count = 0;
+
+    for (i, &page_num) in sorted_pages.iter().enumerate() {
+        let page_offset = page_num as u64 * PAGE_SIZE;
+
+        // Check if this page is consecutive with previous ones
+        let is_consecutive = consecutive_start
+            .map(|start: u64| page_offset == start + (consecutive_count * PAGE_SIZE))
+            .unwrap_or(false);
+
+        if is_consecutive {
+            consecutive_count += 1;
+        } else {
+            // Write previous consecutive batch if exists
+            if let Some(start_offset) = consecutive_start {
+                bytes_written += write_consecutive_zeros(writer, start_offset, consecutive_count, zero_page)?;
+            }
+
+            // Start new consecutive batch
+            consecutive_start = Some(page_offset);
+            consecutive_count = 1;
+        }
+
+        // Write final batch if this is the last page
+        if i == sorted_pages.len() - 1 {
+            if let Some(start_offset) = consecutive_start {
+                bytes_written += write_consecutive_zeros(writer, start_offset, consecutive_count, zero_page)?;
+            }
+        }
+    }
+
+    Ok((page_numbers.len(), bytes_written))
+}
+
+/// Writes consecutive zero pages efficiently by minimizing seek operations.
+fn write_consecutive_zeros(
+    writer: &mut BufWriter<std::fs::File>,
+    start_offset: u64,
+    page_count: u64,
+    zero_page: &[u8],
+) -> Result<u64, CreateSnapshotError> {
+    const PAGE_SIZE: u64 = 4096;
+
+    // Seek to the start position
+    writer.get_mut().seek(SeekFrom::Start(start_offset))
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("seek", err))?;
+
+    // Write consecutive zero pages
+    let total_bytes = page_count * PAGE_SIZE;
+    for _ in 0..page_count {
+        writer.write_all(zero_page)
+            .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+    }
+
+    Ok(total_bytes)
 }
 
 fn snapshot_state_to_file(
@@ -758,5 +955,77 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+    }
+
+    #[test]
+    fn test_zero_pages_batch_efficiency() {
+        use std::collections::HashSet;
+        use std::fs::File;
+        use std::io::{BufWriter, Read, Write};
+        use tempfile::NamedTempFile;
+
+        // Create a temporary file with test data
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_data = vec![0xAA; 16384]; // 4 pages of 0xAA
+        temp_file.write_all(&test_data).unwrap();
+        temp_file.flush().unwrap();
+
+        // Create a bitmap with some free pages
+        let mut free_pages = HashSet::new();
+        free_pages.insert(0); // First page
+        free_pages.insert(2); // Third page
+
+        const PAGE_SIZE: u32 = 4096;
+        let bitmap = crate::snapshot::free_pages::FreePagesbitmap::new(&free_pages, 4, PAGE_SIZE).unwrap();
+
+        // Zero out the free pages
+        zero_free_pages_in_memory_file(temp_file.path(), &bitmap).unwrap();
+
+        // Verify the results
+        let mut file = File::open(temp_file.path()).unwrap();
+        let mut buffer = vec![0u8; 16384];
+        file.read_exact(&mut buffer).unwrap();
+
+        // Page 0 should be zeros
+        assert!(buffer[0..4096].iter().all(|&b| b == 0));
+        // Page 1 should still be 0xAA
+        assert!(buffer[4096..8192].iter().all(|&b| b == 0xAA));
+        // Page 2 should be zeros
+        assert!(buffer[8192..12288].iter().all(|&b| b == 0));
+        // Page 3 should still be 0xAA
+        assert!(buffer[12288..16384].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_consecutive_pages_optimization() {
+        use std::collections::HashSet;
+        use std::fs::File;
+        use std::io::{BufWriter, Read, Write};
+        use tempfile::NamedTempFile;
+
+        // Create test file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_data = vec![0xFF; 32768]; // 8 pages of 0xFF
+        temp_file.write_all(&test_data).unwrap();
+
+        let file = File::open(temp_file.path()).unwrap();
+        let mut writer = BufWriter::new(file);
+        let zero_page = vec![0u8; 4096];
+
+        // Test consecutive pages (should be optimized)
+        let consecutive_pages = vec![0, 1, 2, 3]; // 4 consecutive pages
+        let (pages_processed, bytes_written) = zero_pages_batch(&mut writer, &consecutive_pages, &zero_page).unwrap();
+
+        assert_eq!(pages_processed, 4);
+        assert_eq!(bytes_written, 16384); // 4 * 4096
+
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Verify all 4 pages are zeroed
+        let mut file = File::open(temp_file.path()).unwrap();
+        let mut buffer = vec![0u8; 16384];
+        file.read_exact(&mut buffer).unwrap();
+        assert!(buffer.iter().all(|&b| b == 0));
     }
 }

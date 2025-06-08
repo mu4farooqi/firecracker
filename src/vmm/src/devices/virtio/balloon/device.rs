@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::time::Duration;
+use std::collections::HashSet;
 
 use log::error;
 use serde::Serialize;
@@ -150,6 +151,76 @@ impl BalloonStats {
     }
 }
 
+/// Efficient bitmap for tracking inflated pages during VM runtime.
+/// This uses much less memory than storing individual page numbers.
+#[derive(Debug)]
+struct InflatedPagesBitmap {
+    /// Bitmap where each bit represents whether a page is inflated (1) or not (0).
+    bitmap: Vec<u8>,
+    /// Total number of pages that can be tracked.
+    total_pages: u32,
+}
+
+impl InflatedPagesBitmap {
+    /// Creates a new bitmap for tracking inflated pages.
+    fn new(total_pages: u32) -> Self {
+        let bitmap_bytes = ((total_pages + 7) / 8) as usize;
+        Self {
+            bitmap: vec![0u8; bitmap_bytes],
+            total_pages,
+        }
+    }
+
+    /// Sets a page as inflated.
+    fn set_inflated(&mut self, page_num: u32) {
+        if page_num < self.total_pages {
+            let byte_idx = (page_num / 8) as usize;
+            let bit_idx = page_num % 8;
+            self.bitmap[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    /// Clears a page as not inflated.
+    fn clear_inflated(&mut self, page_num: u32) {
+        if page_num < self.total_pages {
+            let byte_idx = (page_num / 8) as usize;
+            let bit_idx = page_num % 8;
+            self.bitmap[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
+    /// Checks if a page is inflated.
+    fn is_inflated(&self, page_num: u32) -> bool {
+        if page_num >= self.total_pages {
+            return false;
+        }
+        let byte_idx = (page_num / 8) as usize;
+        let bit_idx = page_num % 8;
+        (self.bitmap[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Returns all inflated page numbers as a HashSet for compatibility with existing APIs.
+    fn to_hashset(&self) -> HashSet<u32> {
+        let mut result = HashSet::new();
+        for page_num in 0..self.total_pages {
+            if self.is_inflated(page_num) {
+                result.insert(page_num);
+            }
+        }
+        result
+    }
+
+    /// Returns the number of inflated pages.
+    fn count_inflated(&self) -> usize {
+        self.bitmap.iter().map(|byte| byte.count_ones() as usize).sum()
+    }
+
+    /// Returns the memory overhead of this bitmap in bytes.
+    fn memory_overhead_bytes(&self) -> usize {
+        self.bitmap.len()
+    }
+}
+
 /// Virtio balloon device.
 pub struct Balloon {
     // Virtio fields.
@@ -174,6 +245,8 @@ pub struct Balloon {
     pub(crate) latest_stats: BalloonStats,
     // A buffer used as pfn accumulator during descriptor processing.
     pub(crate) pfn_buffer: [u32; MAX_PAGE_COMPACT_BUFFER],
+    // Memory-efficient bitmap for tracking inflated pages
+    pub(crate) inflated_pages: Option<InflatedPagesBitmap>,
 }
 
 // TODO Use `#[derive(Debug)]` when a new release of
@@ -195,6 +268,8 @@ impl fmt::Debug for Balloon {
             .field("stats_desc_index", &self.stats_desc_index)
             .field("latest_stats", &self.latest_stats)
             .field("pfn_buffer", &self.pfn_buffer)
+            .field("inflated_pages_count", &self.inflated_pages.as_ref().map(|b| b.count_inflated()).unwrap_or(0))
+            .field("inflated_pages_overhead_bytes", &self.inflated_pages.as_ref().map(|b| b.memory_overhead_bytes()).unwrap_or(0))
             .finish()
     }
 }
@@ -252,6 +327,7 @@ impl Balloon {
             stats_desc_index: None,
             latest_stats: BalloonStats::default(),
             pfn_buffer: [0u32; MAX_PAGE_COMPACT_BUFFER],
+            inflated_pages: None,
         })
     }
 
@@ -322,6 +398,7 @@ impl Balloon {
                         break;
                     }
 
+                    // Process all page frame numbers in this descriptor
                     // This is safe, `len` was validated above.
                     for index in (0..len).step_by(SIZE_OF_U32) {
                         let addr = head
@@ -334,6 +411,10 @@ impl Balloon {
                             .map_err(|_| BalloonError::MalformedDescriptor)?;
 
                         self.pfn_buffer[pfn_buffer_idx] = page_frame_number;
+                        // Track this page as inflated directly during queue processing
+                        if let Some(ref mut bitmap) = self.inflated_pages {
+                            bitmap.set_inflated(page_frame_number);
+                        }
                         pfn_buffer_idx += 1;
                     }
                 }
@@ -364,19 +445,40 @@ impl Balloon {
         }
 
         if needs_interrupt {
-            self.signal_used_queue()?;
+           self.signal_used_queue()?;
         }
 
         Ok(())
     }
 
     pub(crate) fn process_deflate_queue(&mut self) -> Result<(), BalloonError> {
+        // This is safe since we checked in the event handler that the device is activated.
+        let mem = self.device_state.mem().unwrap();
         METRICS.deflate_count.inc();
 
         let queue = &mut self.queues[DEFLATE_INDEX];
         let mut needs_interrupt = false;
 
         while let Some(head) = queue.pop()? {
+            let len = head.len as usize;
+
+            // Process deflate descriptors to track which pages are no longer inflated
+            // Note: Original deflate had no length restrictions, so we don't check MAX_PAGES_IN_DESC
+            if !head.is_write_only() && len % SIZE_OF_U32 == 0 {
+                // Process all page frame numbers in this descriptor directly
+                // This is safe, `len` was validated above.
+                for index in (0..len).step_by(SIZE_OF_U32) {
+                    if let Some(addr) = head.addr.checked_add(index as u64) {
+                        if let Ok(page_frame_number) = mem.read_obj::<u32>(addr) {
+                            // Remove this page from inflated pages set directly during queue processing
+                            if let Some(ref mut bitmap) = self.inflated_pages {
+                                bitmap.clear_inflated(page_frame_number);
+                            }
+                        }
+                    }
+                }
+            }
+
             queue.add_used(head.index, 0)?;
             needs_interrupt = true;
         }
@@ -446,6 +548,20 @@ impl Balloon {
     /// Provides the ID of this balloon device.
     pub fn id(&self) -> &str {
         BALLOON_DEV_ID
+    }
+
+    /// Returns the set of inflated page frame numbers.
+    /// These pages are considered free from the guest perspective.
+    pub fn inflated_pages(&self) -> HashSet<u32> {
+        self.inflated_pages
+            .as_ref()
+            .map(|bitmap| bitmap.to_hashset())
+            .unwrap_or_default()
+    }
+
+    /// Returns memory overhead information for tracking inflated pages.
+    pub fn tracking_memory_overhead(&self) -> Option<usize> {
+        self.inflated_pages.as_ref().map(|bitmap| bitmap.memory_overhead_bytes())
     }
 
     fn trigger_stats_update(&mut self) -> Result<(), BalloonError> {
@@ -609,6 +725,12 @@ impl VirtioDevice for Balloon {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
         }
+
+        // Initialize the inflated pages bitmap based on guest memory size
+        let total_memory_bytes: u64 = mem.iter().map(|region| region.len()).sum();
+        const PAGE_SIZE: u64 = 4096;
+        let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
+        self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
 
         self.device_state = DeviceState::Activated(mem);
         if self.activate_evt.write(1).is_err() {
@@ -1146,5 +1268,67 @@ pub(crate) mod tests {
         balloon.write_config(0, &expected_config);
         assert_eq!(balloon.num_pages(), 0x1122_3344);
         assert_eq!(balloon.actual_pages(), 0x1234_5678);
+    }
+
+    #[test]
+    fn test_inflated_pages_tracking() {
+        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mem = default_mem();
+        balloon.activate(mem.clone()).unwrap();
+
+        // Initially no pages should be inflated
+        assert_eq!(balloon.inflated_pages().len(), 0);
+
+        // Verify memory overhead is reasonable
+        if let Some(overhead) = balloon.tracking_memory_overhead() {
+            // For a small test memory, overhead should be minimal
+            assert!(overhead < 1024); // Less than 1KB overhead
+        }
+    }
+
+    #[test]
+    fn test_bitmap_memory_efficiency() {
+        // Test that bitmap uses much less memory than HashSet for large memory
+        let total_pages = 1_000_000u32; // ~4GB worth of pages
+        let bitmap = InflatedPagesBitmap::new(total_pages);
+
+        // Bitmap should use about 125KB (1M bits / 8 bits per byte)
+        let expected_bitmap_bytes = (total_pages + 7) / 8;
+        assert_eq!(bitmap.memory_overhead_bytes(), expected_bitmap_bytes as usize);
+
+        // Compare with what a HashSet would use for all pages
+        let hashset_overhead_per_entry = std::mem::size_of::<u32>() + 8; // Conservative estimate
+        let full_hashset_overhead = total_pages as usize * hashset_overhead_per_entry;
+
+        // Bitmap should be much more efficient
+        assert!(bitmap.memory_overhead_bytes() < full_hashset_overhead / 10);
+    }
+
+    #[test]
+    fn test_bitmap_operations() {
+        let mut bitmap = InflatedPagesBitmap::new(1000);
+
+        // Test setting and checking pages
+        bitmap.set_inflated(100);
+        bitmap.set_inflated(200);
+        bitmap.set_inflated(300);
+
+        assert!(bitmap.is_inflated(100));
+        assert!(bitmap.is_inflated(200));
+        assert!(bitmap.is_inflated(300));
+        assert!(!bitmap.is_inflated(150));
+        assert_eq!(bitmap.count_inflated(), 3);
+
+        // Test clearing
+        bitmap.clear_inflated(200);
+        assert!(!bitmap.is_inflated(200));
+        assert_eq!(bitmap.count_inflated(), 2);
+
+        // Test conversion to HashSet
+        let hashset = bitmap.to_hashset();
+        assert!(hashset.contains(&100));
+        assert!(!hashset.contains(&200));
+        assert!(hashset.contains(&300));
+        assert_eq!(hashset.len(), 2);
     }
 }
