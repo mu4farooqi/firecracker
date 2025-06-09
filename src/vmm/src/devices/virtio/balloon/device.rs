@@ -76,6 +76,8 @@ pub struct BalloonConfig {
     pub deflate_on_oom: bool,
     /// Interval of time in seconds at which the balloon statistics are updated.
     pub stats_polling_interval_s: u16,
+    /// Whether to track inflated pages for snapshot optimization.
+    pub track_free_pages: bool,
 }
 
 /// BalloonStats holds statistics returned from the stats_queue.
@@ -247,6 +249,8 @@ pub struct Balloon {
     pub(crate) pfn_buffer: [u32; MAX_PAGE_COMPACT_BUFFER],
     // Memory-efficient bitmap for tracking inflated pages
     pub(crate) inflated_pages: Option<InflatedPagesBitmap>,
+    // Whether to track free pages for snapshot optimization
+    pub(crate) track_free_pages: bool,
 }
 
 // TODO Use `#[derive(Debug)]` when a new release of
@@ -270,6 +274,7 @@ impl fmt::Debug for Balloon {
             .field("pfn_buffer", &self.pfn_buffer)
             .field("inflated_pages_count", &self.inflated_pages.as_ref().map(|b| b.count_inflated()).unwrap_or(0))
             .field("inflated_pages_overhead_bytes", &self.inflated_pages.as_ref().map(|b| b.memory_overhead_bytes()).unwrap_or(0))
+            .field("track_free_pages", &self.track_free_pages)
             .finish()
     }
 }
@@ -281,6 +286,7 @@ impl Balloon {
         deflate_on_oom: bool,
         stats_polling_interval_s: u16,
         restored_from_file: bool,
+        track_free_pages: bool,
     ) -> Result<Balloon, BalloonError> {
         let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
@@ -327,7 +333,9 @@ impl Balloon {
             stats_desc_index: None,
             latest_stats: BalloonStats::default(),
             pfn_buffer: [0u32; MAX_PAGE_COMPACT_BUFFER],
-            inflated_pages: None,
+            // Only initialize tracking if explicitly enabled to avoid unnecessary memory overhead
+            inflated_pages: if track_free_pages { Some(InflatedPagesBitmap::new(0)) } else { None },
+            track_free_pages,
         })
     }
 
@@ -605,6 +613,35 @@ impl Balloon {
         Ok(())
     }
 
+    /// Update whether to track free pages for snapshot optimization.
+    /// This can be enabled or disabled at runtime.
+    pub fn update_track_free_pages(&mut self, track_free_pages: bool) -> Result<(), BalloonError> {
+        if self.track_free_pages == track_free_pages {
+            return Ok(()); // No change needed
+        }
+
+        self.track_free_pages = track_free_pages;
+
+        if track_free_pages {
+            // Enable tracking - initialize bitmap if device is activated
+            if self.is_activated() {
+                let total_memory_bytes: u64 = self.device_state.mem().unwrap()
+                    .iter().map(|region| region.len()).sum();
+                const PAGE_SIZE: u64 = 4096;
+                let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
+                self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
+            } else {
+                // Device not activated yet, will be initialized on activation
+                self.inflated_pages = Some(InflatedPagesBitmap::new(0));
+            }
+        } else {
+            // Disable tracking - clear bitmap to free memory
+            self.inflated_pages = None;
+        }
+
+        Ok(())
+    }
+
     pub fn update_timer_state(&mut self) {
         let timer_state = TimerState::Periodic {
             current: Duration::from_secs(u64::from(self.stats_polling_interval_s)),
@@ -632,6 +669,11 @@ impl Balloon {
         self.stats_polling_interval_s
     }
 
+    /// Check if free pages tracking is enabled.
+    pub fn track_free_pages(&self) -> bool {
+        self.track_free_pages
+    }
+
     /// Retrieve latest stats for the balloon device.
     pub fn latest_stats(&mut self) -> Option<&BalloonStats> {
         if self.stats_enabled() {
@@ -651,6 +693,7 @@ impl Balloon {
             amount_mib: self.size_mb(),
             deflate_on_oom: self.deflate_on_oom(),
             stats_polling_interval_s: self.stats_polling_interval_s(),
+            track_free_pages: self.track_free_pages(),
         }
     }
 
@@ -726,11 +769,13 @@ impl VirtioDevice for Balloon {
                 .map_err(ActivateError::QueueMemoryError)?;
         }
 
-        // Initialize the inflated pages bitmap based on guest memory size
-        let total_memory_bytes: u64 = mem.iter().map(|region| region.len()).sum();
-        const PAGE_SIZE: u64 = 4096;
-        let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
-        self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
+        // Initialize the inflated pages bitmap based on guest memory size if tracking is enabled
+        if self.inflated_pages.is_some() {
+            let total_memory_bytes: u64 = mem.iter().map(|region| region.len()).sum();
+            const PAGE_SIZE: u64 = 4096;
+            let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
+            self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
+        }
 
         self.device_state = DeviceState::Activated(mem);
         if self.activate_evt.write(1).is_err() {
@@ -849,7 +894,7 @@ pub(crate) mod tests {
         // Test all feature combinations.
         for deflate_on_oom in [true, false].iter() {
             for stats_interval in [0, 1].iter() {
-                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false).unwrap();
+                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false, false).unwrap();
                 assert_eq!(balloon.device_type(), TYPE_BALLOON);
 
                 let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
@@ -876,12 +921,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_read_config() {
-        let balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
 
         let cfg = BalloonConfig {
             amount_mib: 16,
             deflate_on_oom: true,
             stats_polling_interval_s: 0,
+            track_free_pages: false,
         };
         assert_eq!(balloon.config(), cfg);
 
@@ -910,7 +956,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_write_config() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
 
         let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] =
             [0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -936,7 +982,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_invalid_request() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         // Only initialize the inflate queue to demonstrate invalid request handling.
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -995,7 +1041,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(INFLATE_INDEX, infq.create_queue());
@@ -1065,7 +1111,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(DEFLATE_INDEX, defq.create_queue());
@@ -1113,7 +1159,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stats() {
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         let statsq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(STATS_INDEX, statsq.create_queue());
@@ -1200,7 +1246,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_balloon_queues() {
-        let mut balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -1214,7 +1260,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_update_stats_interval() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1223,7 +1269,7 @@ pub(crate) mod tests {
         );
         balloon.update_stats_polling_interval(0).unwrap();
 
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1236,14 +1282,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cannot_update_inactive_device() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Assert that we can't update an inactive device.
         balloon.update_size(1).unwrap_err();
     }
 
     #[test]
     fn test_num_pages() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Switch the state to active.
         balloon.device_state = DeviceState::Activated(single_region_mem(0x1));
 
@@ -1272,18 +1318,59 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inflated_pages_tracking() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        // Enable tracking by passing true for track_free_pages
+        let mut balloon = Balloon::new(0, true, 0, false, true).unwrap();
         let mem = default_mem();
         balloon.activate(mem.clone()).unwrap();
 
         // Initially no pages should be inflated
         assert_eq!(balloon.inflated_pages().len(), 0);
 
-        // Verify memory overhead is reasonable
+        // Verify memory overhead is reasonable when tracking is enabled
         if let Some(overhead) = balloon.tracking_memory_overhead() {
             // For a small test memory, overhead should be minimal
             assert!(overhead < 1024); // Less than 1KB overhead
+        } else {
+            panic!("Memory tracking should be enabled and return overhead information");
         }
+
+        // Test that we can track inflated pages
+        if let Some(ref mut bitmap) = balloon.inflated_pages {
+            bitmap.set_inflated(100);
+            bitmap.set_inflated(200);
+            assert_eq!(bitmap.count_inflated(), 2);
+            assert!(bitmap.is_inflated(100));
+            assert!(bitmap.is_inflated(200));
+            assert!(!bitmap.is_inflated(150));
+        } else {
+            panic!("Inflated pages bitmap should be initialized when tracking is enabled");
+        }
+
+        // Test that inflated_pages() method returns the correct data
+        let inflated_set = balloon.inflated_pages();
+        assert_eq!(inflated_set.len(), 2);
+        assert!(inflated_set.contains(&100));
+        assert!(inflated_set.contains(&200));
+    }
+
+    #[test]
+    fn test_inflated_pages_tracking_disabled() {
+        // Disable tracking by passing false for track_free_pages
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
+        let mem = default_mem();
+        balloon.activate(mem.clone()).unwrap();
+
+        // When tracking is disabled, inflated_pages should return empty set
+        assert_eq!(balloon.inflated_pages().len(), 0);
+
+        // Memory overhead should be None when tracking is disabled
+        assert!(balloon.tracking_memory_overhead().is_none());
+
+        // track_free_pages should return false
+        assert!(!balloon.track_free_pages());
+
+        // inflated_pages should be None
+        assert!(balloon.inflated_pages.is_none());
     }
 
     #[test]

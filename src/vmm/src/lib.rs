@@ -154,6 +154,7 @@ use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
+use crate::vmm_config::balloon::BalloonUpdateConfig;
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -697,10 +698,10 @@ impl Vmm {
     }
 
     /// Updates configuration for the balloon device target size.
-    pub fn update_balloon_config(&mut self, amount_mib: u32) -> Result<(), BalloonError> {
+    pub fn update_balloon_config(&mut self, update_config: &BalloonUpdateConfig) -> Result<(), BalloonError> {
         // The balloon cannot have a target size greater than the size of
         // the guest memory.
-        if u64::from(amount_mib) > mem_size_mib(self.vm.guest_memory()) {
+        if u64::from(update_config.amount_mib) > mem_size_mib(self.vm.guest_memory()) {
             return Err(BalloonError::TooManyPagesRequested);
         }
 
@@ -714,13 +715,22 @@ impl Vmm {
                     .expect("Unexpected device type")
                     .device();
 
-                virtio_device
+                let mut balloon = virtio_device
                     .lock()
-                    .expect("Poisoned lock")
+                    .expect("Poisoned lock");
+
+                let balloon_ref = balloon
                     .as_mut_any()
                     .downcast_mut::<Balloon>()
-                    .unwrap()
-                    .update_size(amount_mib)?;
+                    .unwrap();
+
+                // Update balloon size
+                balloon_ref.update_size(update_config.amount_mib)?;
+
+                // Update tracking if specified
+                if let Some(track_free_pages) = update_config.track_free_pages {
+                    balloon_ref.update_track_free_pages(track_free_pages)?;
+                }
 
                 Ok(())
             }

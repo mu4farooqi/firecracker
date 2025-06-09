@@ -166,12 +166,34 @@ pub fn create_snapshot(
     vmm.vm
         .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
-    // For full snapshots, collect free pages and zero them in memory file for better compression
+    // For full snapshots, optimize free pages in memory file for better compression.
+    // This is only done if balloon devices have tracking enabled via their own
+    // track_free_pages configuration. The balloon device controls when to track
+    // inflated pages during runtime, and snapshots leverage this data if available.
     if matches!(params.snapshot_type, crate::vmm_config::snapshot::SnapshotType::Full) {
-        let free_pages_bitmap = collect_free_pages_for_zeroing(vmm, vm_info)?;
-        // Only zero pages if there are actually any free pages to optimize
-        if free_pages_bitmap.free_page_count() > 0 {
-            zero_free_pages_in_memory_file(&params.mem_file_path, &free_pages_bitmap)?;
+        // Check if any balloon devices have tracking enabled
+        let mut has_balloon_tracking = false;
+        vmm.mmio_device_manager
+            .for_each_virtio_device(|_, _, device_type, dev| {
+                if device_type == &crate::devices::virtio::TYPE_BALLOON {
+                    let d = dev.lock().unwrap();
+                    if let Some(balloon) = d.as_any().downcast_ref::<crate::devices::virtio::balloon::Balloon>() {
+                        if balloon.track_free_pages() {
+                            has_balloon_tracking = true;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // Perform free page optimization if balloon devices are tracking free pages
+        if has_balloon_tracking {
+            let free_pages_bitmap = collect_free_pages_for_zeroing(vmm, vm_info)?;
+            // Only zero pages if there are actually any free pages to optimize
+            if free_pages_bitmap.free_page_count() > 0 {
+                zero_free_pages_in_memory_file(&params.mem_file_path, &free_pages_bitmap)?;
+            }
         }
     }
 
@@ -197,31 +219,45 @@ pub fn create_snapshot(
 
 /// Collects free pages information from balloon devices for memory zeroing optimization.
 /// This creates a temporary bitmap for zeroing but doesn't save it to a file.
+/// Only collects data from balloon devices that have tracking enabled.
 fn collect_free_pages_for_zeroing(
     vmm: &Vmm,
     vm_info: &VmInfo,
 ) -> Result<crate::snapshot::free_pages::FreePagesbitmap, CreateSnapshotError> {
-    use crate::snapshot::free_pages::create_free_pages_bitmap;
-    use std::collections::HashSet;
+    use crate::snapshot::free_pages::create_free_pages_bitmap_from_iterator;
 
-    // Collect inflated pages from all balloon devices
-    let mut all_inflated_pages = HashSet::new();
+    // Calculate total memory pages (assuming 4KB pages)
+    const PAGE_SIZE: u32 = 4096;
+    let total_memory_bytes = vm_info.mem_size_mib * 1024 * 1024;
+    let total_pages = total_memory_bytes / PAGE_SIZE as u64;
+
+    // Create iterator chain for all inflated pages from all tracking-enabled balloon devices
+    let mut page_iterators: Vec<Box<dyn Iterator<Item = u32>>> = Vec::new();
+    let mut tracked_devices = 0;
+    let mut total_inflated_pages = 0;
 
     vmm.mmio_device_manager
         .for_each_virtio_device(|_, _, device_type, dev| {
             if device_type == &crate::devices::virtio::TYPE_BALLOON {
                 let d = dev.lock().unwrap();
                 if let Some(balloon) = d.as_any().downcast_ref::<crate::devices::virtio::balloon::Balloon>() {
-                    let inflated_pages = balloon.inflated_pages();
-                    all_inflated_pages.extend(inflated_pages.iter());
+                    // Only collect data from balloons that have tracking enabled
+                    if balloon.track_free_pages() {
+                        let inflated_pages = balloon.inflated_pages();
+                        total_inflated_pages += inflated_pages.len();
+                        tracked_devices += 1;
 
-                    // Log memory overhead information
-                    if let Some(overhead) = balloon.tracking_memory_overhead() {
-                        crate::logger::info!(
-                            "Balloon device inflated pages tracking overhead: {} KB, {} pages tracked",
-                            overhead / 1024,
-                            inflated_pages.len()
-                        );
+                        // Log memory overhead information
+                        if let Some(overhead) = balloon.tracking_memory_overhead() {
+                            crate::logger::info!(
+                                "Balloon device inflated pages tracking overhead: {} KB, {} pages tracked",
+                                overhead / 1024,
+                                inflated_pages.len()
+                            );
+                        }
+
+                        // Add iterator for this balloon's pages
+                        page_iterators.push(Box::new(inflated_pages.into_iter()));
                     }
                 }
             }
@@ -229,16 +265,15 @@ fn collect_free_pages_for_zeroing(
         })
         .unwrap();
 
-    // Calculate total memory pages (assuming 4KB pages)
-    const PAGE_SIZE: u32 = 4096;
-    let total_memory_bytes = vm_info.mem_size_mib * 1024 * 1024;
-    let total_pages = total_memory_bytes / PAGE_SIZE as u64;
+    // Chain all iterators together for memory-efficient processing
+    let chained_iterator = page_iterators.into_iter().flatten();
 
     // Create the bitmap for zeroing (but don't save to file)
-    let bitmap = create_free_pages_bitmap(&all_inflated_pages, total_pages, PAGE_SIZE)?;
+    let bitmap = create_free_pages_bitmap_from_iterator(chained_iterator, total_pages, PAGE_SIZE)?;
 
     crate::logger::info!(
-        "Collected free pages for memory zeroing: {} free pages out of {} total pages ({:.2}% free)",
+        "Collected free pages for memory zeroing from {} balloon devices: {} free pages out of {} total pages ({:.2}% free)",
+        tracked_devices,
         bitmap.free_page_count(),
         total_pages,
         (bitmap.free_page_count() as f64 / total_pages as f64) * 100.0
@@ -594,7 +629,8 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
-    builder::build_microvm_from_snapshot(
+
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -603,7 +639,9 @@ pub fn restore_from_snapshot(
         seccomp_filters,
         vm_resources,
     )
-    .map_err(RestoreFromSnapshotError::Build)
+    .map_err(RestoreFromSnapshotError::Build)?;
+
+    Ok(vmm)
 }
 
 /// Error type for [`snapshot_state_from_file`]
@@ -757,7 +795,6 @@ fn send_uffd_handshake(
         //      libc::SOL_SOCKET,
         //      libc::SO_PEERCRED,
         //      &mut val as *mut _ as *mut _,
-        //      &mut ucred_size as *mut libc::socklen_t,
         // );
         //
         // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
@@ -976,7 +1013,7 @@ mod tests {
         free_pages.insert(2); // Third page
 
         const PAGE_SIZE: u32 = 4096;
-        let bitmap = crate::snapshot::free_pages::FreePagesbitmap::new(&free_pages, 4, PAGE_SIZE).unwrap();
+        let bitmap = crate::snapshot::free_pages::FreePagesbitmap::from_pages(&free_pages, 4, PAGE_SIZE).unwrap();
 
         // Zero out the free pages
         zero_free_pages_in_memory_file(temp_file.path(), &bitmap).unwrap();

@@ -719,6 +719,13 @@ definitions:
       stats_polling_interval_s:
         type: integer
         description: Interval in seconds between refreshing statistics. A non-zero value will enable the statistics. Defaults to 0.
+      track_free_pages:
+        type: boolean
+        description:
+          Whether to track inflated pages for snapshot optimization. When enabled, the balloon
+          device will maintain a bitmap of inflated pages that can be used during snapshot creation
+          to zero free pages in memory files for better compression. This adds minimal runtime
+          overhead but improves snapshot compression ratios. Defaults to false.
 
   BalloonUpdate:
     type: object
@@ -730,6 +737,13 @@ definitions:
       amount_mib:
         type: integer
         description: Target balloon size in MiB.
+      track_free_pages:
+        type: boolean
+        description:
+          Whether to track inflated pages for snapshot optimization. When enabled, the balloon
+          device will maintain a bitmap of inflated pages that can be used during snapshot creation
+          to zero free pages in memory files for better compression. This adds minimal runtime
+          overhead but improves snapshot compression ratios. Can be toggled at runtime.
 
   BalloonStats:
     type: object
@@ -893,7 +907,7 @@ definitions:
       path_on_host:
         type: string
         description:
-          Host level path for the guest drive. 
+          Host level path for the guest drive.
           This field is required for virtio-block config and should be omitted for vhost-user-block configuration.
       rate_limiter:
         $ref: "#/definitions/RateLimiter"

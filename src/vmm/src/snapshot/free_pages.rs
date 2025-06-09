@@ -29,31 +29,40 @@ pub struct FreePagesbitmap {
 }
 
 impl FreePagesbitmap {
+    /// Creates a new empty free pages bitmap.
+    pub fn new(total_pages: u64, page_size: u32) -> Self {
+        // Calculate bitmap size in bytes (1 bit per page, rounded up to byte boundary)
+        let bitmap_bytes = ((total_pages + 7) / 8) as usize;
+        Self {
+            bitmap: vec![0u8; bitmap_bytes],
+            total_pages,
+            page_size,
+        }
+    }
+
     /// Creates a new free pages bitmap from a set of page numbers.
-    pub fn new(
+    /// This method is kept for compatibility but should be avoided for large page sets.
+    pub fn from_pages(
         free_pages: &HashSet<u32>,
         total_pages: u64,
         page_size: u32,
     ) -> Result<Self, FreePagesError> {
-        // Calculate bitmap size in bytes (1 bit per page, rounded up to byte boundary)
-        let bitmap_bytes = ((total_pages + 7) / 8) as usize;
-        let mut bitmap = vec![0u8; bitmap_bytes];
-
-        // Set bits for free pages
+        let mut bitmap = Self::new(total_pages, page_size);
         for &page_num in free_pages {
-            if page_num as u64 >= total_pages {
-                return Err(FreePagesError::InvalidPageNumber(page_num, total_pages));
-            }
-            let byte_idx = (page_num / 8) as usize;
-            let bit_idx = page_num % 8;
-            bitmap[byte_idx] |= 1 << bit_idx;
+            bitmap.set_page_free(page_num)?;
         }
+        Ok(bitmap)
+    }
 
-        Ok(Self {
-            bitmap,
-            total_pages,
-            page_size,
-        })
+    /// Sets a page as free.
+    pub fn set_page_free(&mut self, page_num: u32) -> Result<(), FreePagesError> {
+        if page_num as u64 >= self.total_pages {
+            return Err(FreePagesError::InvalidPageNumber(page_num, self.total_pages));
+        }
+        let byte_idx = (page_num / 8) as usize;
+        let bit_idx = page_num % 8;
+        self.bitmap[byte_idx] |= 1 << bit_idx;
+        Ok(())
     }
 
     /// Returns the number of free pages by counting set bits.
@@ -72,14 +81,33 @@ impl FreePagesbitmap {
     }
 }
 
+/// Creates a free pages bitmap by directly setting pages without requiring a HashSet.
+/// This function is more memory-efficient as it doesn't create intermediate collections.
+pub fn create_free_pages_bitmap_from_iterator<I>(
+    inflated_pages: I,
+    total_memory_pages: u64,
+    page_size: u32,
+) -> Result<FreePagesbitmap, FreePagesError>
+where
+    I: Iterator<Item = u32>,
+{
+    let mut bitmap = FreePagesbitmap::new(total_memory_pages, page_size);
+    for page_num in inflated_pages {
+        bitmap.set_page_free(page_num)?;
+    }
+    Ok(bitmap)
+}
+
 /// Creates a free pages bitmap from balloon device inflated pages.
 /// This is used for memory zeroing optimization during snapshot creation.
+///
+/// **Deprecated**: Use `create_free_pages_bitmap_from_iterator` for better memory efficiency.
 pub fn create_free_pages_bitmap(
     inflated_pages: &HashSet<u32>,
     total_memory_pages: u64,
     page_size: u32,
 ) -> Result<FreePagesbitmap, FreePagesError> {
-    FreePagesbitmap::new(inflated_pages, total_memory_pages, page_size)
+    FreePagesbitmap::from_pages(inflated_pages, total_memory_pages, page_size)
 }
 
 #[cfg(test)]
@@ -88,12 +116,11 @@ mod tests {
 
     #[test]
     fn test_bitmap_operations() {
-        let mut free_pages = HashSet::new();
-        free_pages.insert(100);
-        free_pages.insert(200);
-        free_pages.insert(300);
+        let mut bitmap = FreePagesbitmap::new(1000, 4096);
 
-        let bitmap = FreePagesbitmap::new(&free_pages, 1000, 4096).unwrap();
+        bitmap.set_page_free(100).unwrap();
+        bitmap.set_page_free(200).unwrap();
+        bitmap.set_page_free(300).unwrap();
 
         // Test is_page_free
         assert!(bitmap.is_page_free(100));
@@ -109,8 +136,7 @@ mod tests {
     fn test_bitmap_memory_efficiency() {
         // Test that bitmap uses minimal memory
         let total_pages = 1_000_000u64; // ~4GB worth of pages
-        let free_pages = HashSet::new(); // Empty set
-        let bitmap = FreePagesbitmap::new(&free_pages, total_pages, 4096).unwrap();
+        let bitmap = FreePagesbitmap::new(total_pages, 4096);
 
         // Bitmap should use about 125KB (1M bits / 8 bits per byte)
         let expected_bitmap_bytes = ((total_pages + 7) / 8) as usize;
@@ -118,7 +144,22 @@ mod tests {
     }
 
     #[test]
-    fn test_create_free_pages_bitmap() {
+    fn test_create_free_pages_bitmap_from_iterator() {
+        let inflated_pages = vec![42, 1337];
+        let bitmap = create_free_pages_bitmap_from_iterator(
+            inflated_pages.into_iter(),
+            10000,
+            4096
+        ).unwrap();
+
+        assert!(bitmap.is_page_free(42));
+        assert!(bitmap.is_page_free(1337));
+        assert!(!bitmap.is_page_free(500));
+        assert_eq!(bitmap.free_page_count(), 2);
+    }
+
+    #[test]
+    fn test_legacy_create_free_pages_bitmap() {
         let mut inflated_pages = HashSet::new();
         inflated_pages.insert(42);
         inflated_pages.insert(1337);
