@@ -93,6 +93,11 @@ pub struct BalloonStats {
     pub target_mib: u32,
     /// The number of MiB the device is currently holding.
     pub actual_mib: u32,
+    /// Number of pages currently tracked as free/inflated in the bitmap.
+    /// Only present when track_free_pages is enabled. This shows the actual
+    /// count of set bits in the internal tracking bitmap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_free_pages: Option<u32>,
     /// Amount of memory swapped in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_in: Option<u64>,
@@ -682,6 +687,14 @@ impl Balloon {
             self.latest_stats.actual_pages = self.config_space.actual_pages;
             self.latest_stats.target_mib = pages_to_mib(self.latest_stats.target_pages);
             self.latest_stats.actual_mib = pages_to_mib(self.latest_stats.actual_pages);
+
+            // Add tracked free pages count if tracking is enabled
+            self.latest_stats.tracked_free_pages = if self.track_free_pages {
+                self.inflated_pages.as_ref().map(|bitmap| bitmap.count_inflated() as u32)
+            } else {
+                None
+            };
+
             Some(&self.latest_stats)
         } else {
             None

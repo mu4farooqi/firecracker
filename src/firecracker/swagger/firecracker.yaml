@@ -767,6 +767,13 @@ definitions:
       actual_mib:
         description: Actual amount of memory (in MiB) the device is holding.
         type: integer
+      tracked_free_pages:
+        description: |
+          Number of pages currently tracked as free/inflated in the internal bitmap.
+          Only present when track_free_pages is enabled. This shows the actual count
+          of set bits in the internal tracking bitmap, which may differ from actual_pages
+          based on guest memory usage patterns.
+        type: integer
       swap_in:
         description: The amount of memory that has been swapped in (in bytes).
         type: integer

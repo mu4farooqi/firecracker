@@ -41,6 +41,7 @@ pub struct BalloonStatsState {
     disk_caches: Option<u64>,
     hugetlb_allocations: Option<u64>,
     hugetlb_failures: Option<u64>,
+    tracked_free_pages: Option<u32>,
 }
 
 impl BalloonStatsState {
@@ -56,6 +57,7 @@ impl BalloonStatsState {
             disk_caches: stats.disk_caches,
             hugetlb_allocations: stats.hugetlb_allocations,
             hugetlb_failures: stats.hugetlb_failures,
+            tracked_free_pages: stats.tracked_free_pages,
         }
     }
 
@@ -75,6 +77,7 @@ impl BalloonStatsState {
             disk_caches: self.disk_caches,
             hugetlb_allocations: self.hugetlb_allocations,
             hugetlb_failures: self.hugetlb_failures,
+            tracked_free_pages: self.tracked_free_pages,
         }
     }
 }
