@@ -114,6 +114,7 @@ impl BalloonBuilder {
             // `restored` flag is false because this code path
             // is never called by snapshot restore functionality.
             false,
+            cfg.track_free_pages,
         )?)));
 
         Ok(())

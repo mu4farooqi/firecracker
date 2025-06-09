@@ -127,6 +127,7 @@ impl Persist<'_> for Balloon {
             false,
             state.stats_polling_interval_s,
             constructor_args.restored_from_file,
+            false,
         )?;
 
         let mut num_queues = BALLOON_NUM_QUEUES;
@@ -192,7 +193,7 @@ mod tests {
         let mut mem = vec![0; 4096];
 
         // Create and save the balloon device.
-        let balloon = Balloon::new(0x42, false, 2, false).unwrap();
+        let balloon = Balloon::new(0x42, false, 2, false, false).unwrap();
 
         Snapshot::serialize(&mut mem.as_mut_slice(), &balloon.save()).unwrap();
 

@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Write, BufWriter, Seek, SeekFrom};
 use std::mem::forget;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -174,8 +174,8 @@ pub fn create_snapshot(
         // Check if any balloon devices have tracking enabled
         let mut has_balloon_tracking = false;
         vmm.mmio_device_manager
-            .for_each_virtio_device(|_, _, device_type, dev| {
-                if device_type == &crate::devices::virtio::TYPE_BALLOON {
+            .for_each_virtio_device(|virtio_type, _, _, dev| {
+                if virtio_type == crate::devices::virtio::TYPE_BALLOON {
                     let d = dev.lock().unwrap();
                     if let Some(balloon) = d.as_any().downcast_ref::<crate::devices::virtio::balloon::Balloon>() {
                         if balloon.track_free_pages() {
@@ -183,7 +183,7 @@ pub fn create_snapshot(
                         }
                     }
                 }
-                Ok(())
+                Ok::<(), CreateSnapshotError>(())
             })
             .unwrap();
 
@@ -237,8 +237,8 @@ fn collect_free_pages_for_zeroing(
     let mut total_inflated_pages = 0;
 
     vmm.mmio_device_manager
-        .for_each_virtio_device(|_, _, device_type, dev| {
-            if device_type == &crate::devices::virtio::TYPE_BALLOON {
+        .for_each_virtio_device(|virtio_type, _, _, dev| {
+            if virtio_type == crate::devices::virtio::TYPE_BALLOON {
                 let d = dev.lock().unwrap();
                 if let Some(balloon) = d.as_any().downcast_ref::<crate::devices::virtio::balloon::Balloon>() {
                     // Only collect data from balloons that have tracking enabled
@@ -261,7 +261,7 @@ fn collect_free_pages_for_zeroing(
                     }
                 }
             }
-            Ok(())
+            Ok::<(), CreateSnapshotError>(())
         })
         .unwrap();
 
@@ -289,7 +289,6 @@ fn zero_free_pages_in_memory_file(
     bitmap: &crate::snapshot::free_pages::FreePagesbitmap,
 ) -> Result<(), CreateSnapshotError> {
     use std::fs::OpenOptions;
-    use std::io::{BufWriter, Seek, SeekFrom, Write};
 
     const PAGE_SIZE: u64 = 4096;
     const ZERO_BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for efficient I/O
@@ -308,10 +307,10 @@ fn zero_free_pages_in_memory_file(
     let mut bytes_zeroed = 0u64;
 
     // Process free pages in batches for efficiency
-    let mut current_batch = Vec::new();
+    let mut current_batch: Vec<u32> = Vec::new();
 
     // Collect all free pages into batches
-    for page_num in 0..bitmap.total_pages {
+    for page_num in 0..(bitmap.total_pages as u32) {
         if bitmap.is_page_free(page_num) {
             current_batch.push(page_num);
 

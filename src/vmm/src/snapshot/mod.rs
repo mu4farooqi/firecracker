@@ -24,6 +24,7 @@
 //! The snapshot format uses a version value in the form of `MAJOR.MINOR.PATCH`. The version is
 //! provided by the library clients (it is not tied to this crate).
 pub mod crc;
+pub mod free_pages;
 mod persist;
 use std::fmt::Debug;
 use std::io::{Read, Write};
