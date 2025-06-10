@@ -138,13 +138,21 @@ impl UffdHandler {
     }
 
     pub fn serve_pf(&mut self, addr: *mut u8, len: usize) -> bool {
+        // Assert that len matches our page size to catch misuse
+        assert_eq!(len, self.page_size, "serve_pf called with len != page_size");
+
         // Find the start of the page that the current faulting address belongs to.
         let dst = (addr as usize & !(self.page_size - 1)) as *mut libc::c_void;
         let fault_page_addr = dst as u64;
         let fault_pfn = fault_page_addr / self.page_size as u64;
 
-        if self.removed_pages.contains(&fault_pfn) {
-            return self.zero_out(fault_page_addr);
+        if self.removed_pages.contains_value(&fault_pfn) {
+            let ok = self.zero_out(fault_page_addr);
+            if ok {
+                // Successfully zero-paged, remove this PFN from tracking to prevent memory leak
+                self.removed_pages.remove(fault_pfn..fault_pfn + 1);
+            }
+            return ok;
         }
 
         for region in self.mem_regions.iter() {
@@ -192,7 +200,8 @@ impl UffdHandler {
     fn zero_out(&mut self, addr: u64) -> bool {
         match unsafe { self.uffd.zeropage(addr as *mut _, self.page_size, true) } {
             Ok(_) => true,
-            Err(Error::ZeropageFailed(error)) if error as i32 == libc::EAGAIN => false,
+            Err(Error::ZeropageFailed(error))
+                if [libc::EAGAIN, libc::EEXIST].contains(&(error as i32)) => false,
             r => panic!("Unexpected zeropage result: {:?}", r),
         }
     }

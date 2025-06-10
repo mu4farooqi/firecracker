@@ -32,27 +32,19 @@ fn main() {
         // This avoids the race condition where pagefaults might be processed before
         // their corresponding remove events, ensuring correct zero-page vs file-backed behavior.
 
-        let mut deferred_pagefaults: Vec<*mut std::ffi::c_void> = Vec::new();
+        let mut deferred_pfns: Vec<u64> = Vec::new();
 
         loop {
             // Phase 1: Collect all available events
             let mut events = Vec::new();
 
-            // First process any deferred pagefaults from previous iteration
-            for addr in deferred_pagefaults.drain(..) {
-                events.push(Event::Pagefault {
-                    addr,
-                    rw: userfaultfd::ReadWrite::Read
-                });
-            }
-
-            // Then read all new events from UFFD
+            // Read all new events from UFFD first
             while let Some(event) = uffd_handler.read_event().expect("Failed to read uffd_msg") {
                 events.push(event);
             }
 
-            // If no events to process, we're done
-            if events.is_empty() {
+            // If no new events and no deferred pagefaults, we're done
+            if events.is_empty() && deferred_pfns.is_empty() {
                 break;
             }
 
@@ -64,22 +56,33 @@ fn main() {
                 }
             }
 
-            // Phase 3: Process Pagefault events
-            // After all removes are processed, handle pagefaults in arrival order
+            // Phase 3: Process Pagefault events (both new ones and deferred ones)
             let mut new_deferred = Vec::new();
 
+            // Process new pagefault events
             for event in events {
                 if let Event::Pagefault { addr, .. } = event {
                     // serve_pf returns false if it encounters EAGAIN (due to pending remove events)
                     if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
-                        // Defer this pagefault to be retried in the next iteration
-                        new_deferred.push(addr);
+                        // Convert address to PFN and defer for retry
+                        let pfn = (addr as u64) / uffd_handler.page_size as u64;
+                        new_deferred.push(pfn);
                     }
                 }
                 // Other event types are ignored as per original logic
             }
 
-            deferred_pagefaults = new_deferred;
+            // Process deferred PFNs from previous iteration
+            for pfn in deferred_pfns.drain(..) {
+                // Convert PFN back to address
+                let addr = (pfn * uffd_handler.page_size as u64) as *mut std::ffi::c_void;
+                if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
+                    // Still can't handle it, defer again
+                    new_deferred.push(pfn);
+                }
+            }
+
+            deferred_pfns = new_deferred;
 
             // Continue looping if we have deferred pagefaults
             // This handles the case where remove events arrive after we've read the initial batch
