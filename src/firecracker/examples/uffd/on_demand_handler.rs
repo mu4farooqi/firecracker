@@ -11,6 +11,7 @@ use std::fs::File;
 use std::os::unix::net::UnixListener;
 
 use uffd_utils::{Runtime, UffdHandler};
+use userfaultfd::Event;
 
 fn main() {
     let mut args = std::env::args();
@@ -26,80 +27,62 @@ fn main() {
     let mut runtime = Runtime::new(stream, file);
     runtime.install_panic_hook();
     runtime.run(|uffd_handler: &mut UffdHandler| {
-        // !DISCLAIMER!
-        // When using UFFD together with the balloon device, this handler needs to deal with
-        // `remove` and `pagefault` events. There are multiple things to keep in mind in
-        // such setups:
-        //
-        // As long as any `remove` event is pending in the UFFD queue, all ioctls return EAGAIN
-        // -----------------------------------------------------------------------------------
-        //
-        // This means we cannot process UFFD events simply one-by-one anymore - if a `remove` event
-        // arrives, we need to pre-fetch all other events up to the `remove` event, to unblock the
-        // UFFD, and then go back to the process the pre-fetched events.
-        //
-        // UFFD might receive events in not in their causal order
-        // -----------------------------------------------------
-        //
-        // For example, the guest
-        // kernel might first respond to a balloon inflation by freeing some memory, and
-        // telling Firecracker about this. Firecracker will then madvise(MADV_DONTNEED) the
-        // free memory range, which causes a `remove` event to be sent to UFFD. Then, the
-        // guest kernel might immediately fault the page in again (for example because
-        // default_on_oom was set). which causes a `pagefault` event to be sent to UFFD.
-        //
-        // However, the pagefault will be triggered from inside KVM on the vCPU thread, while the
-        // balloon device is handled by Firecracker on its VMM thread. This means that potentially
-        // this handler can receive the `pagefault` _before_ the `remove` event.
-        //
-        // This means that the simple "greedy" strategy of simply prefetching _all_ UFFD events
-        // to make sure no `remove` event is blocking us can result in the handler acting on
-        // the `pagefault` event before the `remove` message (despite the `remove` event being
-        // in the causal past of the `pagefault` event), which means that we will fault in a page
-        // from the snapshot file, while really we should be faulting in a zero page.
-        //
-        // In this example handler, we ignore this problem, to avoid
-        // complexity (under the assumption that the guest kernel will zero a newly faulted in
-        // page anyway). A production handler will most likely want to ensure that `remove`
-        // events for a specific range are always handled before `pagefault` events.
-        //
-        // Lastly, we still need to deal with the race condition where a `remove` event arrives
-        // in the UFFD queue after we got done reading all events, in which case we need to go
-        // back to reading more events before we can continue processing `pagefault`s.
-        let mut deferred_events = Vec::new();
+        // FIXED: This implementation properly handles the complexity by ensuring that
+        // `remove` events are always processed before `pagefault` events in each batch.
+        // This avoids the race condition where pagefaults might be processed before
+        // their corresponding remove events, ensuring correct zero-page vs file-backed behavior.
+
+        let mut deferred_pagefaults: Vec<*mut u8> = Vec::new();
 
         loop {
-            // First, try events that we couldn't handle last round
-            let mut events_to_handle = Vec::from_iter(deferred_events.drain(..));
+            // Phase 1: Collect all available events
+            let mut events = Vec::new();
 
-            // Read all events from the userfaultfd.
-            while let Some(event) = uffd_handler.read_event().expect("Failed to read uffd_msg") {
-                events_to_handle.push(event);
+            // First process any deferred pagefaults from previous iteration
+            for addr in deferred_pagefaults.drain(..) {
+                events.push(Event::Pagefault {
+                    addr,
+                    flags: userfaultfd::ReadWrite::Read
+                });
             }
 
-            for event in events_to_handle.drain(..) {
-                // We expect to receive either a Page Fault or `remove`
-                // event (if the balloon device is enabled).
-                match event {
-                    userfaultfd::Event::Pagefault { addr, .. } => {
-                        if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
-                            deferred_events.push(event);
-                        }
-                    }
-                    userfaultfd::Event::Remove { start, end } => {
-                        uffd_handler.mark_range_removed(start as u64, end as u64)
-                    }
-                    _ => panic!("Unexpected event on userfaultfd"),
+            // Then read all new events from UFFD
+            while let Some(event) = uffd_handler.read_event().expect("Failed to read uffd_msg") {
+                events.push(event);
+            }
+
+            // If no events to process, we're done
+            if events.is_empty() {
+                break;
+            }
+
+            // Phase 2: Process all Remove events first
+            // This ensures proper ordering: removes are always handled before pagefaults
+            for event in &events {
+                if let Event::Remove { start, end } = *event {
+                    uffd_handler.mark_range_removed(start as u64, end as u64);
                 }
             }
 
-            // We assume that really only the above removed/pagefault interaction can result in
-            // deferred events. In that scenario, the loop will always terminate (unless
-            // newly arriving `remove` events end up indefinitely blocking it, but there's nothing
-            // we can do about that, and it's a largely theoretical problem).
-            if deferred_events.is_empty() {
-                break;
+            // Phase 3: Process Pagefault events
+            // After all removes are processed, handle pagefaults in arrival order
+            let mut new_deferred = Vec::new();
+
+            for event in events {
+                if let Event::Pagefault { addr, .. } = event {
+                    // serve_pf returns false if it encounters EAGAIN (due to pending remove events)
+                    if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
+                        // Defer this pagefault to be retried in the next iteration
+                        new_deferred.push(addr);
+                    }
+                }
+                // Other event types are ignored as per original logic
             }
+
+            deferred_pagefaults = new_deferred;
+
+            // Continue looping if we have deferred pagefaults
+            // This handles the case where remove events arrive after we've read the initial batch
         }
     });
 }

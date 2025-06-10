@@ -4,7 +4,7 @@
 // Not everything is used by both binaries
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::time::Duration;
 
+use rangemap::RangeSet;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{Error, Event, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -49,7 +50,7 @@ pub struct UffdHandler {
     pub page_size: usize,
     backing_buffer: *const u8,
     uffd: Uffd,
-    removed_pages: HashSet<u64>,
+    removed_pages: RangeSet<u64>,
 }
 
 impl UffdHandler {
@@ -120,7 +121,7 @@ impl UffdHandler {
             page_size,
             backing_buffer,
             uffd,
-            removed_pages: HashSet::new(),
+            removed_pages: RangeSet::new(),
         }
     }
 
@@ -132,9 +133,8 @@ impl UffdHandler {
         let pfn_start = start / self.page_size as u64;
         let pfn_end = end / self.page_size as u64;
 
-        for pfn in pfn_start..pfn_end {
-            self.removed_pages.insert(pfn);
-        }
+        // Insert the range of removed pages efficiently
+        self.removed_pages.insert(pfn_start..pfn_end);
     }
 
     pub fn serve_pf(&mut self, addr: *mut u8, len: usize) -> bool {
