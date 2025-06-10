@@ -146,7 +146,7 @@ impl UffdHandler {
         let fault_page_addr = dst as u64;
         let fault_pfn = fault_page_addr / self.page_size as u64;
 
-        if self.removed_pages.contains_value(&fault_pfn) {
+        if self.removed_pages.contains(&fault_pfn) {
             let ok = self.zero_out(fault_page_addr);
             if ok {
                 // Successfully zero-paged, remove this PFN from tracking to prevent memory leak
