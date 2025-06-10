@@ -32,7 +32,7 @@ fn main() {
         // This avoids the race condition where pagefaults might be processed before
         // their corresponding remove events, ensuring correct zero-page vs file-backed behavior.
 
-        let mut deferred_pagefaults: Vec<*mut u8> = Vec::new();
+        let mut deferred_pagefaults: Vec<*mut std::ffi::c_void> = Vec::new();
 
         loop {
             // Phase 1: Collect all available events
@@ -42,7 +42,7 @@ fn main() {
             for addr in deferred_pagefaults.drain(..) {
                 events.push(Event::Pagefault {
                     addr,
-                    flags: userfaultfd::ReadWrite::Read
+                    rw: userfaultfd::ReadWrite::Read
                 });
             }
 
