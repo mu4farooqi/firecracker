@@ -397,15 +397,28 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
-        self.mmio_device_manager.kick_devices();
+        use crate::utils::time::get_time_us;
+        use crate::utils::time::ClockType;
 
-        // Send the events.
+        let total_start_us = get_time_us(ClockType::Monotonic);
+
+        // Kick devices first
+        let kick_start_us = get_time_us(ClockType::Monotonic);
+        self.mmio_device_manager.kick_devices();
+        let kick_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(kick_start_us);
+        debug!("Device kick phase took {} us.", kick_elapsed_us);
+
+        // Send resume events to vCPUs
+        let send_start_us = get_time_us(ClockType::Monotonic);
         self.vcpus_handles
             .iter()
             .try_for_each(|handle| handle.send_event(VcpuEvent::Resume))
             .map_err(|_| VmmError::VcpuMessage)?;
+        let send_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(send_start_us);
+        debug!("vCPU resume events sent in {} us.", send_elapsed_us);
 
-        // Check the responses.
+        // Wait for vCPU responses
+        let wait_start_us = get_time_us(ClockType::Monotonic);
         if self
             .vcpus_handles
             .iter()
@@ -414,8 +427,15 @@ impl Vmm {
         {
             return Err(VmmError::VcpuMessage);
         }
+        let wait_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(wait_start_us);
+        debug!("vCPU resume responses received in {} us.", wait_elapsed_us);
 
         self.instance_info.state = VmState::Running;
+
+        let total_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(total_start_us);
+        info!("VM resume completed in {} us (kick: {}, send: {}, wait: {})",
+              total_elapsed_us, kick_elapsed_us, send_elapsed_us, wait_elapsed_us);
+
         Ok(())
     }
 

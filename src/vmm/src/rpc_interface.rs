@@ -577,8 +577,14 @@ impl<'a> PrebootApiController<'a> {
             // If restore fails, we consider the process is too dirty to recover.
             self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
         })?;
+
+        let restore_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(load_start_us);
+        info!("Snapshot restore took {} us.", restore_elapsed_us);
+        update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_restore_snapshot, load_start_us);
+
         // Resume VM
         if load_params.resume_vm {
+            let resume_start_us = get_time_us(ClockType::Monotonic);
             vmm.lock()
                 .expect("Poisoned lock")
                 .resume_vm()
@@ -586,6 +592,9 @@ impl<'a> PrebootApiController<'a> {
                     // If resume fails, we consider the process is too dirty to recover.
                     self.fatal_error = Some(BuildMicrovmFromRequestsError::Resume);
                 })?;
+            let resume_elapsed_us = get_time_us(ClockType::Monotonic).saturating_sub(resume_start_us);
+            info!("VM resume after snapshot load took {} us.", resume_elapsed_us);
+            update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_resume_after_snapshot, resume_start_us);
         }
         // Set the VM
         self.built_vmm = Some(vmm);

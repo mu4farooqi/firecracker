@@ -590,54 +590,8 @@ impl MmdsMetrics {
     }
 }
 
-/// Performance metrics related for the moment only to snapshots.
-// These store the duration of creating/loading a snapshot and of
-// pausing/resuming the microVM.
-// If there are more than one `/snapshot/create` request in a minute
-// (until the metrics are flushed), only the duration of the last
-// snapshot creation is stored in the metric. If the user is interested
-// in all the durations, a `FlushMetrics` request should be sent after
-// each `create` request.
-#[derive(Debug, Default, Serialize)]
-pub struct PerformanceMetrics {
-    /// Measures the snapshot full create time, at the API (user) level, in microseconds.
-    pub full_create_snapshot: SharedStoreMetric,
-    /// Measures the snapshot diff create time, at the API (user) level, in microseconds.
-    pub diff_create_snapshot: SharedStoreMetric,
-    /// Measures the snapshot load time, at the API (user) level, in microseconds.
-    pub load_snapshot: SharedStoreMetric,
-    /// Measures the microVM pausing duration, at the API (user) level, in microseconds.
-    pub pause_vm: SharedStoreMetric,
-    /// Measures the microVM resuming duration, at the API (user) level, in microseconds.
-    pub resume_vm: SharedStoreMetric,
-    /// Measures the snapshot full create time, at the VMM level, in microseconds.
-    pub vmm_full_create_snapshot: SharedStoreMetric,
-    /// Measures the snapshot diff create time, at the VMM level, in microseconds.
-    pub vmm_diff_create_snapshot: SharedStoreMetric,
-    /// Measures the snapshot load time, at the VMM level, in microseconds.
-    pub vmm_load_snapshot: SharedStoreMetric,
-    /// Measures the microVM pausing duration, at the VMM level, in microseconds.
-    pub vmm_pause_vm: SharedStoreMetric,
-    /// Measures the microVM resuming duration, at the VMM level, in microseconds.
-    pub vmm_resume_vm: SharedStoreMetric,
-}
-impl PerformanceMetrics {
-    /// Const default construction.
-    pub const fn new() -> Self {
-        Self {
-            full_create_snapshot: SharedStoreMetric::new(),
-            diff_create_snapshot: SharedStoreMetric::new(),
-            load_snapshot: SharedStoreMetric::new(),
-            pause_vm: SharedStoreMetric::new(),
-            resume_vm: SharedStoreMetric::new(),
-            vmm_full_create_snapshot: SharedStoreMetric::new(),
-            vmm_diff_create_snapshot: SharedStoreMetric::new(),
-            vmm_load_snapshot: SharedStoreMetric::new(),
-            vmm_pause_vm: SharedStoreMetric::new(),
-            vmm_resume_vm: SharedStoreMetric::new(),
-        }
-    }
-}
+/// Metrics related to performance measurements.
+pub latencies_us: LatencyMetrics,
 
 /// Metrics for the seccomp filtering.
 #[derive(Debug, Default, Serialize)]
@@ -826,6 +780,46 @@ impl VmmMetrics {
     }
 }
 
+/// Measurements related to latency of processing incoming API requests.
+#[derive(Clone, Debug, Default)]
+pub struct LatencyMetrics {
+    /// API server side latency for processing incoming API requests for the pause vm action.
+    pub pause_vm: SharedStoreMetric,
+    /// API server side latency for processing incoming API requests for the resume vm action.
+    pub resume_vm: SharedStoreMetric,
+    /// VMM latency for creating a full snapshot.
+    pub vmm_full_create_snapshot: SharedStoreMetric,
+    /// VMM latency for creating a diff snapshot.
+    pub vmm_diff_create_snapshot: SharedStoreMetric,
+    /// VMM latency for loading a snapshot (includes both restore and potentially resume).
+    pub vmm_load_snapshot: SharedStoreMetric,
+    /// VMM latency for pausing the microVM.
+    pub vmm_pause_vm: SharedStoreMetric,
+    /// VMM latency for resuming the microVM.
+    pub vmm_resume_vm: SharedStoreMetric,
+    /// VMM latency for restoring VM state from snapshot (restore only, not resume).
+    pub vmm_restore_snapshot: SharedStoreMetric,
+    /// VMM latency for resuming VM after snapshot load.
+    pub vmm_resume_after_snapshot: SharedStoreMetric,
+}
+
+impl LatencyMetrics {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            pause_vm: SharedStoreMetric::new(),
+            resume_vm: SharedStoreMetric::new(),
+            vmm_full_create_snapshot: SharedStoreMetric::new(),
+            vmm_diff_create_snapshot: SharedStoreMetric::new(),
+            vmm_load_snapshot: SharedStoreMetric::new(),
+            vmm_pause_vm: SharedStoreMetric::new(),
+            vmm_resume_vm: SharedStoreMetric::new(),
+            vmm_restore_snapshot: SharedStoreMetric::new(),
+            vmm_resume_after_snapshot: SharedStoreMetric::new(),
+        }
+    }
+}
+
 // The sole purpose of this struct is to produce an UTC timestamp when an instance is serialized.
 #[derive(Debug, Default)]
 struct SerializeToUtcTimestampMs;
@@ -890,7 +884,7 @@ pub struct FirecrackerMetrics {
     /// Metrics related to the legacy device.
     pub legacy_dev_ser: LegacyDevMetricsSerializeProxy,
     /// Metrics related to performance measurements.
-    pub latencies_us: PerformanceMetrics,
+    pub latencies_us: LatencyMetrics,
     /// Logging related metrics.
     pub logger: LoggerSystemMetrics,
     /// Metrics specific to MMDS functionality.
@@ -931,7 +925,7 @@ impl FirecrackerMetrics {
             deprecated_api: DeprecatedApiMetrics::new(),
             get_api_requests: GetRequestsMetrics::new(),
             legacy_dev_ser: LegacyDevMetricsSerializeProxy {},
-            latencies_us: PerformanceMetrics::new(),
+            latencies_us: LatencyMetrics::new(),
             logger: LoggerSystemMetrics::new(),
             mmds: MmdsMetrics::new(),
             net_ser: NetMetricsSerializeProxy {},
