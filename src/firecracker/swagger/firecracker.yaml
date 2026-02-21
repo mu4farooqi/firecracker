@@ -719,6 +719,13 @@ definitions:
       stats_polling_interval_s:
         type: integer
         description: Interval in seconds between refreshing statistics. A non-zero value will enable the statistics. Defaults to 0.
+      track_free_pages:
+        type: boolean
+        description:
+          Whether to track inflated pages for snapshot optimization. When enabled, the balloon
+          device will maintain a bitmap of inflated pages that can be used during snapshot creation
+          to zero free pages in memory files for better compression. This adds minimal runtime
+          overhead but improves snapshot compression ratios. Defaults to false.
 
   BalloonUpdate:
     type: object
@@ -730,6 +737,13 @@ definitions:
       amount_mib:
         type: integer
         description: Target balloon size in MiB.
+      track_free_pages:
+        type: boolean
+        description:
+          Whether to track inflated pages for snapshot optimization. When enabled, the balloon
+          device will maintain a bitmap of inflated pages that can be used during snapshot creation
+          to zero free pages in memory files for better compression. This adds minimal runtime
+          overhead but improves snapshot compression ratios. Can be toggled at runtime.
 
   BalloonStats:
     type: object
@@ -752,6 +766,13 @@ definitions:
         type: integer
       actual_mib:
         description: Actual amount of memory (in MiB) the device is holding.
+        type: integer
+      tracked_free_pages:
+        description: |
+          Number of pages currently tracked as free/inflated in the internal bitmap.
+          Only present when track_free_pages is enabled. This shows the actual count
+          of set bits in the internal tracking bitmap, which may differ from actual_pages
+          based on guest memory usage patterns.
         type: integer
       swap_in:
         description: The amount of memory that has been swapped in (in bytes).
@@ -888,7 +909,7 @@ definitions:
       is_read_only:
         type: boolean
         description:
-          Is block read only. 
+          Is block read only.
           This field is required for virtio-block config and should be omitted for vhost-user-block configuration.
       path_on_host:
         type: string

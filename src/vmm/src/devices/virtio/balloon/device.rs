@@ -3,11 +3,13 @@
 
 use std::fmt;
 use std::time::Duration;
+use std::collections::HashSet;
 
 use log::error;
 use serde::Serialize;
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use vmm_sys_util::eventfd::EventFd;
+use vm_memory::GuestMemory;
 
 use super::super::device::{DeviceState, VirtioDevice};
 use super::super::queue::Queue;
@@ -29,7 +31,7 @@ use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::queue::InvalidAvailIdx;
 use crate::logger::IncMetric;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+use crate::vstate::memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap, GuestMemoryRegion};
 
 const SIZE_OF_U32: usize = std::mem::size_of::<u32>();
 const SIZE_OF_STAT: usize = std::mem::size_of::<BalloonStat>();
@@ -75,6 +77,8 @@ pub struct BalloonConfig {
     pub deflate_on_oom: bool,
     /// Interval of time in seconds at which the balloon statistics are updated.
     pub stats_polling_interval_s: u16,
+    /// Whether to track inflated pages for snapshot optimization.
+    pub track_free_pages: bool,
 }
 
 /// BalloonStats holds statistics returned from the stats_queue.
@@ -89,6 +93,11 @@ pub struct BalloonStats {
     pub target_mib: u32,
     /// The number of MiB the device is currently holding.
     pub actual_mib: u32,
+    /// Number of pages currently tracked as free/inflated in the bitmap.
+    /// Only present when track_free_pages is enabled. This shows the actual
+    /// count of set bits in the internal tracking bitmap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_free_pages: Option<u32>,
     /// Amount of memory swapped in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_in: Option<u64>,
@@ -150,6 +159,76 @@ impl BalloonStats {
     }
 }
 
+/// Efficient bitmap for tracking inflated pages during VM runtime.
+/// This uses much less memory than storing individual page numbers.
+#[derive(Debug)]
+struct InflatedPagesBitmap {
+    /// Bitmap where each bit represents whether a page is inflated (1) or not (0).
+    bitmap: Vec<u8>,
+    /// Total number of pages that can be tracked.
+    total_pages: u32,
+}
+
+impl InflatedPagesBitmap {
+    /// Creates a new bitmap for tracking inflated pages.
+    fn new(total_pages: u32) -> Self {
+        let bitmap_bytes = ((total_pages + 7) / 8) as usize;
+        Self {
+            bitmap: vec![0u8; bitmap_bytes],
+            total_pages,
+        }
+    }
+
+    /// Sets a page as inflated.
+    fn set_inflated(&mut self, page_num: u32) {
+        if page_num < self.total_pages {
+            let byte_idx = (page_num / 8) as usize;
+            let bit_idx = page_num % 8;
+            self.bitmap[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    /// Clears a page as not inflated.
+    fn clear_inflated(&mut self, page_num: u32) {
+        if page_num < self.total_pages {
+            let byte_idx = (page_num / 8) as usize;
+            let bit_idx = page_num % 8;
+            self.bitmap[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
+    /// Checks if a page is inflated.
+    fn is_inflated(&self, page_num: u32) -> bool {
+        if page_num >= self.total_pages {
+            return false;
+        }
+        let byte_idx = (page_num / 8) as usize;
+        let bit_idx = page_num % 8;
+        (self.bitmap[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Returns all inflated page numbers as a HashSet for compatibility with existing APIs.
+    fn to_hashset(&self) -> HashSet<u32> {
+        let mut result = HashSet::new();
+        for page_num in 0..self.total_pages {
+            if self.is_inflated(page_num) {
+                result.insert(page_num);
+            }
+        }
+        result
+    }
+
+    /// Returns the number of inflated pages.
+    fn count_inflated(&self) -> usize {
+        self.bitmap.iter().map(|byte| byte.count_ones() as usize).sum()
+    }
+
+    /// Returns the memory overhead of this bitmap in bytes.
+    fn memory_overhead_bytes(&self) -> usize {
+        self.bitmap.len()
+    }
+}
+
 /// Virtio balloon device.
 pub struct Balloon {
     // Virtio fields.
@@ -174,6 +253,10 @@ pub struct Balloon {
     pub(crate) latest_stats: BalloonStats,
     // A buffer used as pfn accumulator during descriptor processing.
     pub(crate) pfn_buffer: [u32; MAX_PAGE_COMPACT_BUFFER],
+    // Memory-efficient bitmap for tracking inflated pages
+    pub(crate) inflated_pages: Option<InflatedPagesBitmap>,
+    // Whether to track free pages for snapshot optimization
+    pub(crate) track_free_pages: bool,
 }
 
 // TODO Use `#[derive(Debug)]` when a new release of
@@ -195,6 +278,9 @@ impl fmt::Debug for Balloon {
             .field("stats_desc_index", &self.stats_desc_index)
             .field("latest_stats", &self.latest_stats)
             .field("pfn_buffer", &self.pfn_buffer)
+            .field("inflated_pages_count", &self.inflated_pages.as_ref().map(|b| b.count_inflated()).unwrap_or(0))
+            .field("inflated_pages_overhead_bytes", &self.inflated_pages.as_ref().map(|b| b.memory_overhead_bytes()).unwrap_or(0))
+            .field("track_free_pages", &self.track_free_pages)
             .finish()
     }
 }
@@ -206,6 +292,7 @@ impl Balloon {
         deflate_on_oom: bool,
         stats_polling_interval_s: u16,
         restored_from_file: bool,
+        track_free_pages: bool,
     ) -> Result<Balloon, BalloonError> {
         let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
@@ -252,6 +339,9 @@ impl Balloon {
             stats_desc_index: None,
             latest_stats: BalloonStats::default(),
             pfn_buffer: [0u32; MAX_PAGE_COMPACT_BUFFER],
+            // Only initialize tracking if explicitly enabled to avoid unnecessary memory overhead
+            inflated_pages: if track_free_pages { Some(InflatedPagesBitmap::new(0)) } else { None },
+            track_free_pages,
         })
     }
 
@@ -322,6 +412,7 @@ impl Balloon {
                         break;
                     }
 
+                    // Process all page frame numbers in this descriptor
                     // This is safe, `len` was validated above.
                     for index in (0..len).step_by(SIZE_OF_U32) {
                         let addr = head
@@ -334,6 +425,10 @@ impl Balloon {
                             .map_err(|_| BalloonError::MalformedDescriptor)?;
 
                         self.pfn_buffer[pfn_buffer_idx] = page_frame_number;
+                        // Track this page as inflated directly during queue processing
+                        if let Some(ref mut bitmap) = self.inflated_pages {
+                            bitmap.set_inflated(page_frame_number);
+                        }
                         pfn_buffer_idx += 1;
                     }
                 }
@@ -364,19 +459,40 @@ impl Balloon {
         }
 
         if needs_interrupt {
-            self.signal_used_queue()?;
+           self.signal_used_queue()?;
         }
 
         Ok(())
     }
 
     pub(crate) fn process_deflate_queue(&mut self) -> Result<(), BalloonError> {
+        // This is safe since we checked in the event handler that the device is activated.
+        let mem = self.device_state.mem().unwrap();
         METRICS.deflate_count.inc();
 
         let queue = &mut self.queues[DEFLATE_INDEX];
         let mut needs_interrupt = false;
 
         while let Some(head) = queue.pop()? {
+            let len = head.len as usize;
+
+            // Process deflate descriptors to track which pages are no longer inflated
+            // Note: Original deflate had no length restrictions, so we don't check MAX_PAGES_IN_DESC
+            if !head.is_write_only() && len % SIZE_OF_U32 == 0 {
+                // Process all page frame numbers in this descriptor directly
+                // This is safe, `len` was validated above.
+                for index in (0..len).step_by(SIZE_OF_U32) {
+                    if let Some(addr) = head.addr.checked_add(index as u64) {
+                        if let Ok(page_frame_number) = mem.read_obj::<u32>(addr) {
+                            // Remove this page from inflated pages set directly during queue processing
+                            if let Some(ref mut bitmap) = self.inflated_pages {
+                                bitmap.clear_inflated(page_frame_number);
+                            }
+                        }
+                    }
+                }
+            }
+
             queue.add_used(head.index, 0)?;
             needs_interrupt = true;
         }
@@ -448,6 +564,20 @@ impl Balloon {
         BALLOON_DEV_ID
     }
 
+    /// Returns the set of inflated page frame numbers.
+    /// These pages are considered free from the guest perspective.
+    pub fn inflated_pages(&self) -> HashSet<u32> {
+        self.inflated_pages
+            .as_ref()
+            .map(|bitmap| bitmap.to_hashset())
+            .unwrap_or_default()
+    }
+
+    /// Returns memory overhead information for tracking inflated pages.
+    pub fn tracking_memory_overhead(&self) -> Option<usize> {
+        self.inflated_pages.as_ref().map(|bitmap| bitmap.memory_overhead_bytes())
+    }
+
     fn trigger_stats_update(&mut self) -> Result<(), BalloonError> {
         // The communication is driven by the device by using the buffer
         // and sending a used buffer notification
@@ -489,6 +619,35 @@ impl Balloon {
         Ok(())
     }
 
+    /// Update whether to track free pages for snapshot optimization.
+    /// This can be enabled or disabled at runtime.
+    pub fn update_track_free_pages(&mut self, track_free_pages: bool) -> Result<(), BalloonError> {
+        if self.track_free_pages == track_free_pages {
+            return Ok(()); // No change needed
+        }
+
+        self.track_free_pages = track_free_pages;
+
+        if track_free_pages {
+            // Enable tracking - initialize bitmap if device is activated
+            if self.is_activated() {
+                let total_memory_bytes: u64 = self.device_state.mem().unwrap()
+                    .iter().map(|region| region.len()).sum();
+                const PAGE_SIZE: u64 = 4096;
+                let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
+                self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
+            } else {
+                // Device not activated yet, will be initialized on activation
+                self.inflated_pages = Some(InflatedPagesBitmap::new(0));
+            }
+        } else {
+            // Disable tracking - clear bitmap to free memory
+            self.inflated_pages = None;
+        }
+
+        Ok(())
+    }
+
     pub fn update_timer_state(&mut self) {
         let timer_state = TimerState::Periodic {
             current: Duration::from_secs(u64::from(self.stats_polling_interval_s)),
@@ -516,6 +675,11 @@ impl Balloon {
         self.stats_polling_interval_s
     }
 
+    /// Check if free pages tracking is enabled.
+    pub fn track_free_pages(&self) -> bool {
+        self.track_free_pages
+    }
+
     /// Retrieve latest stats for the balloon device.
     pub fn latest_stats(&mut self) -> Option<&BalloonStats> {
         if self.stats_enabled() {
@@ -523,6 +687,14 @@ impl Balloon {
             self.latest_stats.actual_pages = self.config_space.actual_pages;
             self.latest_stats.target_mib = pages_to_mib(self.latest_stats.target_pages);
             self.latest_stats.actual_mib = pages_to_mib(self.latest_stats.actual_pages);
+
+            // Add tracked free pages count if tracking is enabled
+            self.latest_stats.tracked_free_pages = if self.track_free_pages {
+                self.inflated_pages.as_ref().map(|bitmap| bitmap.count_inflated() as u32)
+            } else {
+                None
+            };
+
             Some(&self.latest_stats)
         } else {
             None
@@ -535,6 +707,7 @@ impl Balloon {
             amount_mib: self.size_mb(),
             deflate_on_oom: self.deflate_on_oom(),
             stats_polling_interval_s: self.stats_polling_interval_s(),
+            track_free_pages: self.track_free_pages(),
         }
     }
 
@@ -608,6 +781,14 @@ impl VirtioDevice for Balloon {
         for q in self.queues.iter_mut() {
             q.initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
+        }
+
+        // Initialize the inflated pages bitmap based on guest memory size if tracking is enabled
+        if self.inflated_pages.is_some() {
+            let total_memory_bytes: u64 = mem.iter().map(|region| region.len()).sum();
+            const PAGE_SIZE: u64 = 4096;
+            let total_pages = (total_memory_bytes / PAGE_SIZE) as u32;
+            self.inflated_pages = Some(InflatedPagesBitmap::new(total_pages));
         }
 
         self.device_state = DeviceState::Activated(mem);
@@ -727,7 +908,7 @@ pub(crate) mod tests {
         // Test all feature combinations.
         for deflate_on_oom in [true, false].iter() {
             for stats_interval in [0, 1].iter() {
-                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false).unwrap();
+                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false, false).unwrap();
                 assert_eq!(balloon.device_type(), TYPE_BALLOON);
 
                 let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
@@ -754,12 +935,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_read_config() {
-        let balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
 
         let cfg = BalloonConfig {
             amount_mib: 16,
             deflate_on_oom: true,
             stats_polling_interval_s: 0,
+            track_free_pages: false,
         };
         assert_eq!(balloon.config(), cfg);
 
@@ -788,7 +970,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_write_config() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
 
         let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] =
             [0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -814,7 +996,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_invalid_request() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         // Only initialize the inflate queue to demonstrate invalid request handling.
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -873,7 +1055,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(INFLATE_INDEX, infq.create_queue());
@@ -943,7 +1125,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(DEFLATE_INDEX, defq.create_queue());
@@ -991,7 +1173,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stats() {
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         let statsq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(STATS_INDEX, statsq.create_queue());
@@ -1078,7 +1260,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_balloon_queues() {
-        let mut balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -1092,7 +1274,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_update_stats_interval() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1101,7 +1283,7 @@ pub(crate) mod tests {
         );
         balloon.update_stats_polling_interval(0).unwrap();
 
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1114,14 +1296,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cannot_update_inactive_device() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Assert that we can't update an inactive device.
         balloon.update_size(1).unwrap_err();
     }
 
     #[test]
     fn test_num_pages() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Switch the state to active.
         balloon.device_state = DeviceState::Activated(single_region_mem(0x1));
 
@@ -1146,5 +1328,108 @@ pub(crate) mod tests {
         balloon.write_config(0, &expected_config);
         assert_eq!(balloon.num_pages(), 0x1122_3344);
         assert_eq!(balloon.actual_pages(), 0x1234_5678);
+    }
+
+    #[test]
+    fn test_inflated_pages_tracking() {
+        // Enable tracking by passing true for track_free_pages
+        let mut balloon = Balloon::new(0, true, 0, false, true).unwrap();
+        let mem = default_mem();
+        balloon.activate(mem.clone()).unwrap();
+
+        // Initially no pages should be inflated
+        assert_eq!(balloon.inflated_pages().len(), 0);
+
+        // Verify memory overhead is reasonable when tracking is enabled
+        if let Some(overhead) = balloon.tracking_memory_overhead() {
+            // For a small test memory, overhead should be minimal
+            assert!(overhead < 1024); // Less than 1KB overhead
+        } else {
+            panic!("Memory tracking should be enabled and return overhead information");
+        }
+
+        // Test that we can track inflated pages
+        if let Some(ref mut bitmap) = balloon.inflated_pages {
+            bitmap.set_inflated(100);
+            bitmap.set_inflated(200);
+            assert_eq!(bitmap.count_inflated(), 2);
+            assert!(bitmap.is_inflated(100));
+            assert!(bitmap.is_inflated(200));
+            assert!(!bitmap.is_inflated(150));
+        } else {
+            panic!("Inflated pages bitmap should be initialized when tracking is enabled");
+        }
+
+        // Test that inflated_pages() method returns the correct data
+        let inflated_set = balloon.inflated_pages();
+        assert_eq!(inflated_set.len(), 2);
+        assert!(inflated_set.contains(&100));
+        assert!(inflated_set.contains(&200));
+    }
+
+    #[test]
+    fn test_inflated_pages_tracking_disabled() {
+        // Disable tracking by passing false for track_free_pages
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
+        let mem = default_mem();
+        balloon.activate(mem.clone()).unwrap();
+
+        // When tracking is disabled, inflated_pages should return empty set
+        assert_eq!(balloon.inflated_pages().len(), 0);
+
+        // Memory overhead should be None when tracking is disabled
+        assert!(balloon.tracking_memory_overhead().is_none());
+
+        // track_free_pages should return false
+        assert!(!balloon.track_free_pages());
+
+        // inflated_pages should be None
+        assert!(balloon.inflated_pages.is_none());
+    }
+
+    #[test]
+    fn test_bitmap_memory_efficiency() {
+        // Test that bitmap uses much less memory than HashSet for large memory
+        let total_pages = 1_000_000u32; // ~4GB worth of pages
+        let bitmap = InflatedPagesBitmap::new(total_pages);
+
+        // Bitmap should use about 125KB (1M bits / 8 bits per byte)
+        let expected_bitmap_bytes = (total_pages + 7) / 8;
+        assert_eq!(bitmap.memory_overhead_bytes(), expected_bitmap_bytes as usize);
+
+        // Compare with what a HashSet would use for all pages
+        let hashset_overhead_per_entry = std::mem::size_of::<u32>() + 8; // Conservative estimate
+        let full_hashset_overhead = total_pages as usize * hashset_overhead_per_entry;
+
+        // Bitmap should be much more efficient
+        assert!(bitmap.memory_overhead_bytes() < full_hashset_overhead / 10);
+    }
+
+    #[test]
+    fn test_bitmap_operations() {
+        let mut bitmap = InflatedPagesBitmap::new(1000);
+
+        // Test setting and checking pages
+        bitmap.set_inflated(100);
+        bitmap.set_inflated(200);
+        bitmap.set_inflated(300);
+
+        assert!(bitmap.is_inflated(100));
+        assert!(bitmap.is_inflated(200));
+        assert!(bitmap.is_inflated(300));
+        assert!(!bitmap.is_inflated(150));
+        assert_eq!(bitmap.count_inflated(), 3);
+
+        // Test clearing
+        bitmap.clear_inflated(200);
+        assert!(!bitmap.is_inflated(200));
+        assert_eq!(bitmap.count_inflated(), 2);
+
+        // Test conversion to HashSet
+        let hashset = bitmap.to_hashset();
+        assert!(hashset.contains(&100));
+        assert!(!hashset.contains(&200));
+        assert!(hashset.contains(&300));
+        assert_eq!(hashset.len(), 2);
     }
 }

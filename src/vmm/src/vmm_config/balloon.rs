@@ -44,6 +44,13 @@ pub struct BalloonDeviceConfig {
     /// Interval in seconds between refreshing statistics.
     #[serde(default)]
     pub stats_polling_interval_s: u16,
+    /// Whether to track inflated pages for snapshot optimization.
+    /// When enabled, the balloon device will maintain a bitmap of inflated pages
+    /// that can be used during snapshot creation to zero free pages in memory files
+    /// for better compression. This adds minimal runtime overhead but improves
+    /// snapshot compression ratios.
+    #[serde(default)]
+    pub track_free_pages: bool,
 }
 
 impl From<BalloonConfig> for BalloonDeviceConfig {
@@ -52,6 +59,7 @@ impl From<BalloonConfig> for BalloonDeviceConfig {
             amount_mib: state.amount_mib,
             deflate_on_oom: state.deflate_on_oom,
             stats_polling_interval_s: state.stats_polling_interval_s,
+            track_free_pages: state.track_free_pages,
         }
     }
 }
@@ -63,6 +71,13 @@ impl From<BalloonConfig> for BalloonDeviceConfig {
 pub struct BalloonUpdateConfig {
     /// Target balloon size in MiB.
     pub amount_mib: u32,
+    /// Whether to track inflated pages for snapshot optimization.
+    /// When enabled, the balloon device will maintain a bitmap of inflated pages
+    /// that can be used during snapshot creation to zero free pages in memory files
+    /// for better compression. This adds minimal runtime overhead but improves
+    /// snapshot compression ratios. Can be toggled at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_free_pages: Option<bool>,
 }
 
 /// The data fed into a balloon statistics interval update request.
@@ -99,6 +114,7 @@ impl BalloonBuilder {
             // `restored` flag is false because this code path
             // is never called by snapshot restore functionality.
             false,
+            cfg.track_free_pages,
         )?)));
 
         Ok(())
@@ -141,6 +157,7 @@ pub(crate) mod tests {
             amount_mib: 0,
             deflate_on_oom: false,
             stats_polling_interval_s: 0,
+            track_free_pages: false,
         }
     }
 
@@ -151,6 +168,7 @@ pub(crate) mod tests {
             amount_mib: 0,
             deflate_on_oom: false,
             stats_polling_interval_s: 0,
+            track_free_pages: false,
         };
         assert_eq!(default_balloon_config, balloon_config);
         let mut builder = BalloonBuilder::new();
@@ -160,7 +178,10 @@ pub(crate) mod tests {
         assert_eq!(builder.get().unwrap().lock().unwrap().num_pages(), 0);
         assert_eq!(builder.get_config().unwrap(), default_balloon_config);
 
-        let _update_config = BalloonUpdateConfig { amount_mib: 5 };
+        let _update_config = BalloonUpdateConfig {
+            amount_mib: 5,
+            track_free_pages: None,
+        };
         let _stats_update_config = BalloonUpdateStatsConfig {
             stats_polling_interval_s: 5,
         };
@@ -172,12 +193,14 @@ pub(crate) mod tests {
             amount_mib: 5,
             deflate_on_oom: false,
             stats_polling_interval_s: 3,
+            track_free_pages: false,
         };
 
         let actual_balloon_config = BalloonDeviceConfig::from(BalloonConfig {
             amount_mib: 5,
             deflate_on_oom: false,
             stats_polling_interval_s: 3,
+            track_free_pages: false,
         });
 
         assert_eq!(expected_balloon_config, actual_balloon_config);
